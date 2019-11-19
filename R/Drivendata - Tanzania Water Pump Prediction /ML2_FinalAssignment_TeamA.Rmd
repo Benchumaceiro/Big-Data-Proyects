@@ -1,0 +1,516 @@
+---
+title: "Final Assignment- Pump-It-Up-Data-Mining-The-Water-Competition"
+subtitle: "Benjamín Chumaceiro | Rosalía Contreras | Eduardo Cort Pons | Maria Joyce | Ignacio Mouawad | Srishti Singh"
+output: 
+  html_document:
+    toc: true
+    toc_depth: 3
+author: "Team A"
+---
+
+# Setup Environment
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+rm(list = ls())
+gc()
+library("rpart")
+library(ggplot2)
+library(plyr)
+library(dplyr)     # To compute the `union` of the levels.
+library(png)       # To include images in this document.
+library(knitr)     # To include images inline in this doc.
+library(moments)   # Skewness
+library(e1071)     # Alternative for Skewness
+library(glmnet)    # Lasso
+library(caret)     # To enable Lasso training with CV.
+library(data.table)
+library(geosphere)
+library(lubridate)
+library(FSelector)
+```
+
+# Load Data
+```{r Load Data}
+training <- read.csv("data/training_set_values.csv")
+test <- read.csv("data/test_set_values.csv")
+training_labels <- read.csv("data/training_set_labels.csv")
+stacked <- rbind(training, test)
+```
+First, let us plot our a frequency chart of our target variable to understand the distribution, to understand any imbalances in our data.
+
+# General Exploration of Data
+
+We started by ploting the overall count of water pumps per group:
+```{r}
+plot(training_labels$status_group)
+```
+
+  The mayority (>30.000) of the pumps in the dataset are functional, only a small number of water pumps need repair (<5.000) and the rest are non functional.
+  
+  Now lets look at some statistics of the columns we have, to determine if some columns have NA values, have a majority of 0 values, and what their data types are.  
+
+```{r}
+summary(stacked)
+```
+
+**Amount_tsh:** Total static head (amount water available to waterpoint). The mean and median are 0, meaning that more than half our dataset contains 0 values. After further investigation we found that 70% of our data contains 0s.
+
+Checking uniquenes of and levels of region and region_code.
+```{r}
+sum(stacked$amount_tsh==0)/nrow(stacked)
+
+length(levels(stacked$region))
+length(unique(stacked$region_code))
+
+```
+
+
+# Data Cleaning
+Also, set to NA for any calumn that has an empty string.
+```{r}
+stacked[stacked == ""] <- NA
+```
+
+
+## Hunting for NAs
+```{r}
+na.cols <- which(colSums(is.na(stacked)) > 0)
+paste('There are', length(na.cols), 'columns with missing values')
+sort(colSums(sapply(stacked[na.cols], is.na)), decreasing = TRUE)
+```
+
+## Replacing with unknowns and fixing Lower and upper case inconcintancies
+We realized that some of the values can be the same but one is in uppercase and the other is in lowercase. It was decided to change all the bellow features to lower case to make it easier for the model to identify values that are equal.
+
+```{r}
+stacked$scheme_management = factor(stacked$scheme_management, levels=c(levels(stacked$scheme_management), "unknown"))
+stacked$scheme_management[is.na(stacked$scheme_management)] = "unknown"
+
+stacked$scheme_name = factor(stacked$scheme_name, levels=c(levels(stacked$scheme_name), "unknown"))
+stacked$scheme_name[is.na(stacked$scheme_name)] = "unknown"
+
+stacked$funder <- as.factor(tolower(stacked$funder))
+stacked$installer <- as.factor(tolower(stacked$installer))
+
+
+stacked$funder[is.na(stacked$funder)] = "unknown"
+
+stacked$installer[is.na(stacked$installer)] = "unknown"
+
+stacked$subvillage = factor(stacked$subvillage, levels=c(levels(stacked$subvillage), "unknown"))
+stacked$subvillage[is.na(stacked$subvillage)] = "unknown"
+
+stacked$public_meeting = factor(stacked$public_meeting, levels=c(levels(stacked$public_meeting), "unknown"))
+stacked$public_meeting[is.na(stacked$public_meeting)] = "unknown"
+
+stacked$permit = factor(stacked$permit, levels=c(levels(stacked$permit), "unknown"))
+stacked$permit[is.na(stacked$permit)] = "unknown"
+```
+
+Checking for missing values
+```{r NAs discovery}
+na.cols <- which(colSums(is.na(stacked)) > 0)
+paste('There are', length(na.cols), 'columns with missing values')
+```
+
+**Some interesting insights we get from our data statitics:**
+
+**ID:**
+Id is unique, since all the mean and median are exhibiting the same value. However since we already have time of insertion of the data and construction year, we cannot infer anything from that column and therefore we will remove that column from the stacked dataset (training and test datasets).
+
+**recorded_by:**
+This feature has only one type of value so is not meaninfull.
+
+**num_private:**
+This feature had mor than 99% of values equal zero
+
+```{r}
+stacked$id <- NULL
+stacked$recorded_by <- NULL # becuase the values where all the same
+stacked$num_private <- NULL #
+```
+
+## Factorizing columns & Binning large categorical features
+```{r}
+stacked$region_code<- as.factor(stacked$region_code)
+```
+
+**Categorical features with a large number of unique values:**
+-funder_group
+-installer_group
+-scheme_management_group
+-scheme_name_group
+-extraction_type_grouped
+-management_grouped 
+
+This features where bin with the folowing loops:
+```{r}
+funder_group <- vector()
+for(i in 1:nrow(stacked)){
+  if(stacked$funder[i] %in% c("government of tanzania", "ministry of water")){funder_group[i] <- "tanzania_government"}
+  else if(stacked$funder[i] %in% c("danida","world bank", "hesawa", "unicef", "netherlands", "germany republi")){funder_group[i] <- "international_funding" }
+  else if(stacked$funder[i] %in% c("rwssp", "kkkt", "tasaf", "dhv")){funder_group[i] <- "major_tan_comps" }
+  else{funder_group[i] <- "others"}
+  
+}
+stacked$funder_group <- as.factor(funder_group)
+
+installer_group <- vector()
+for(i in 1:nrow(stacked)){
+  if(stacked$installer[i] == "dwe"){installer_group[i] <- "dwe"}
+  else if(stacked$installer[i] %in% c("danida","world bank", "hesawa", "unicef", "netherlands", "germany republi", "danid")){installer_group[i] <- "international_installer" }
+  else if(stacked$installer[i] %in% c("government", "central government", "gover")){installer_group[i] <- "government_inst" }
+  else{installer_group[i] <- "others"}
+  if(stacked$installer[i] == "rwe"){installer_group[i] <- "rwe"}
+   else{installer_group[i] <- "others"}
+}
+
+stacked$installer_group <- as.factor(installer_group)
+
+scheme_management_group <- vector()
+for(i in 1:nrow(stacked)){
+  if(stacked$scheme_management[i] == "VWC"){scheme_management_group[i] <- "vwc"}
+   else if(stacked$scheme_management[i] %in% c("WUG", "Water authority", "Water Board", "WUA")){scheme_management_group[i] <- "water_groups" }
+  else { scheme_management_group[i] <- "other"}
+}
+
+stacked$scheme_management_group <- as.factor(scheme_management_group)
+
+scheme_name_group <- vector()
+for(i in 1:nrow(stacked)){
+  if(stacked$scheme_name[i] == "unknown"){scheme_name_group[i] <- "unknown"}
+  else{scheme_name_group[i] <- "other"}
+
+}
+
+stacked$scheme_name_group <- as.factor(scheme_name_group)
+
+extraction_type_grouped <- vector()
+for(i in 1:nrow(stacked)){
+  if(stacked$extraction_type[i] %in% c("india mark ii", "afridev", "ksb", "other - rope pump", "other - swn 81", "india mark iii", "windmill", "cemo", "other - play pump", "walimi", "climax")){extraction_type_grouped[i] <- "others"}
+  else{extraction_type_grouped[i] <- stacked$extraction_type[i]}
+}
+stacked$extraction_type_grouped <- as.factor(extraction_type_grouped)
+
+management_grouped <- vector()
+for(i in 1:nrow(stacked)){
+  if(stacked$management[i] %in% c("vwc", "wug", "water board", "wau")){management_grouped[i] <- stacked$management[i]}
+  else{management_grouped[i] <- "others"}
+}
+stacked$management_grouped <- as.factor(management_grouped)
+
+```
+
+**Removing features for reducing unnecessary compuational power**
+wpt_name, lga, subvillage had no major categories inside so we decided having too many categories would cause huge compuational power and maybe some bias in our model, so we decided to remove it
+
+```{r}
+stacked$wpt_name <- NULL
+stacked$lga <- NULL
+stacked$subvillage <- NULL
+```
+
+## Filling in missing values:
+
+**Imputting avg_height:** To make sure that gps height = 0 is not missing data, we grouped by region with the average gps_height and we were able to locate the regions at sea level and those above for.
+```{r}
+dt <- data.table(training)
+dt[, list(avg_height = mean(gps_height)),by = "region"][order(avg_height,decreasing = FALSE)]
+dt[training$gps_height <=0, list(avg_height = mean(gps_height)),by = "region"][order(avg_height,decreasing = FALSE)]  
+```
+
+
+**Imputing 0 values in longitude and latitude:**
+We impute longitud and latitude by computing the mean of the region.
+```{r}
+dt<- data.table(stacked)
+dt[stacked$longitude <= 0, list(region) ,by = "region"]
+
+summary(stacked$longitude)
+stacked$longitude[stacked$longitude==0 & stacked$region=="Shinyanga"] <- mean(training$longitude[training$longitude!=0 & training$region=="Shinyanga"])
+stacked$longitude[stacked$longitude==0 & stacked$region=="Mwanza"] <- mean(training$longitude[training$longitude!=0 & training$region=="Mwanza"])
+
+summary(stacked$longitude)
+
+dt[stacked$latitude == max(stacked$latitude), list(region) ,by = "region"]
+summary(stacked$latitude)
+stacked$latitude[stacked$latitude==max(stacked$latitude) & stacked$region=="Shinyanga"] <- mean(training$latitude[training$latitude!=max(stacked$latitude) & training$region=="Shinyanga"])
+
+stacked$latitude[stacked$latitude==max(stacked$latitude) & stacked$region=="Mwanza"] <- mean(training$latitude[training$latitude!=max(stacked$latitude) & training$region=="Mwanza"])
+
+summary(stacked$latitude)
+```
+
+**Replacing missing values in construction_year**
+
+For construction year we noticed ther are many unknown years with 0 values. we decided to, in order not to mess with the stats of our column, replace the following years with random normal distrsibution with the same max, min, mean, and standard deviation of the year column.
+
+```{r}
+summary(stacked$construction_year[stacked$construction_year!=0])
+sum(stacked$construction_year==0)
+sd(stacked$construction_year[stacked$construction_year!=0])
+
+mysamp <- function(n, m, s, lwr, upr, nnorm) {
+  samp <- rnorm(nnorm, m, s)
+  samp <- samp[samp >= lwr & samp <= upr]
+  if (length(samp) >= n) {
+    return(sample(samp, n))
+  }  
+  stop(simpleError("Not enough values to sample from. Try increasing nnorm."))
+}
+
+set.seed(42)
+mysamp(n=10, m=39.74, s=25.09, lwr=0, upr=340, nnorm=1000)
+
+
+
+stacked$construction_year[stacked$construction_year==0] <- mysamp(n = length(stacked$construction_year[stacked$construction_year==0]),m = 1997,s= sd(stacked$construction_year[stacked$construction_year!=0]), lwr = min(stacked$construction_year[stacked$construction_year!=0]), upr = max(stacked$construction_year[stacked$construction_year!=0]), nnorm = length(stacked$construction_year[stacked$construction_year!=0]))
+summary(stacked$construction_year[stacked$construction_year!=0])
+sum(stacked$construction_year==0)
+#sum(stacked$construction_year[stacked$construction_year==0])
+```
+
+
+# Feature engineering
+
+Computing the distance of each point based on latitud and longitud from the capital city (Dodoma)
+```{r}
+dt <- data.table(stacked)
+
+stacked$distance <-mutate(stacked, 
+       Distance = distHaversine(c(36.04196, -5.940758),
+                                cbind((longitude), (latitude))))$Distance
+```
+
+Creating 3 new features based on month, year and age since contruction
+```{r}
+stacked$month <- month(ymd(stacked$date_recorded))
+stacked$year <- year(ymd(stacked$date_recorded))
+stacked$age <- stacked$year - stacked$construction_year
+```
+
+We searched for Tanzanian seasons, in order to understand their winters and how that might affect the functionality of the pumps. According to expertafrica.com, tanzania has 2 rainy seasons, the first from November to December, and the second from March to to May. The other months belong to the dry seasons (from June to October, January & February). Therefore we decided to create a seasonal category for these months. We got this idea from: https://github.com/drivendataorg/pump-it-up
+
+```{r}
+season <- vector()
+for(i in 1:nrow(stacked)){
+  if(stacked$month[i] %in% c(1,2,6,7,8,9,10)){
+    season[i] <- "dry"
+  }
+  else {season[i] <- "wet"}
+}
+head(stacked)
+
+stacked$season <- as.factor(season)
+stacked$month <- as.factor(stacked$month)
+stacked$year <- as.factor(stacked$year)
+```
+
+We log some features.
+```{r}
+stacked$population <- log10(stacked$population+1)
+stacked$amount_tsh <- log10(stacked$amount_tsh+1)
+stacked$gps_height <- scale(stacked$gps_height)
+stacked$distance <- log10(stacked$distance+1)
+
+```
+
+# Dimensionality Reduction
+
+We computed Chi-Squared for selecting the most important categorical features
+```{r Chi-Squared}
+training_with_label <- cbind(stacked[1:nrow(training_labels),], training_labels)
+
+library(FSelector)
+weights<- data.frame(chi.squared(status_group~., training_with_label)) # Chi-squared computation
+weights$feature <- rownames(weights)
+weights[order(weights$attr_importance, decreasing = TRUE),] # Order the features by their weights
+chi_squared_features <- weights$feature[weights$attr_importance > 0.1] # Remove the features with importance lower than the threshold
+
+chi_squared_features
+```
+
+
+Deleting similar columns based on Chi Squared
+```{r}
+postchi <- stacked[colnames(stacked) %in% chi_squared_features]
+postchi$funder <- NULL
+postchi$installer <- NULL
+postchi$ward <- NULL
+postchi$quantity_group <- NULL
+postchi$extraction_type_group <- NULL
+postchi$extraction_type_class <- NULL
+postchi$waterpoint_type_group <- NULL
+postchi$region_code <- NULL
+postchi$district_code <- NULL
+postchi$payment_type <- NULL
+postchi$scheme_management <- NULL
+postchi$longitude <- NULL
+postchi$latitude <- NULL
+postchi$construction_year <- NULL
+postchi$source_type <- NULL
+postchi$month <- NULL
+postchi$date_recorded <- NULL
+postchi$scheme_name <- NULL
+postchi$quality_group <- NULL
+
+colnames(postchi)
+```
+
+**Information Gain**
+
+We use information gain to confirm our decision for removing or leaving variables in the model.
+```{r Information Gain}
+weights<- data.frame(information.gain(status_group~., training_with_label))
+weights$feature <- rownames(weights)
+weights[order(weights$attr_importance, decreasing = TRUE),]
+information_gain_features <- weights$feature[weights$attr_importance > 0.015]
+```
+
+```{r}
+postchi_ig <- stacked[colnames(postchi) %in% information_gain_features]
+```
+
+#Models
+## Random Forest Classifier
+For us to be able to run Random Forest, we had to limit our column choices because R doesn't allow us to process data with more than 53 categories. Therefore, to narrow our decisions, and to keep it up for the Random Forest algorithm to use its own sub-selection methodology, we used Chi Squared and info-gain, and followed our intuition to eliminate some of the features.
+
+```{r }
+trainmodel1 <- cbind(postchi[1:nrow(training_labels),], status_group = training_labels$status_group)
+library(randomForest)
+rf_classifier = randomForest(status_group ~ ., data=trainmodel1, importance=TRUE)
+rf_classifier
+importance(rf_classifier)
+```
+
+```{r}
+pred = predict(rf_classifier, stacked[(nrow(training_labels)+1):nrow(stacked),])
+
+test_pred2 <- cbind(test$id, as.data.frame(pred))
+colnames(test_pred2) <- c("id","status_group")
+write.csv(test_pred2, "rf_pred_R.csv")
+```
+
+##SVM
+
+Here we used Support-vector machines (SVM) to create another model.
+First, we tried this, using the polynomial kernel: 
+
+```{r}
+#classifier = svm(formula = status_group ~ ., data = trainmodel1, type = 'C-classification', 
+                #  kernel = 'polynomial')
+```
+
+**The resulting classifier looks like this:**
+
+**Parameters:**
+1. SVM-Type:  C-classification 
+2. SVM-Kernel:  polynomial 
+3. cost:  1 
+4. degree:  3 
+5. coef.0:  0 
+
+Number of Support Vectors:  49748
+
+classifier
+
+```{r}
+#pred = predict(classifier, stacked[(nrow(training_labels)+1):nrow(stacked),])
+
+#test_pred3 <- cbind(test$id, as.data.frame(pred))
+#colnames(test_pred3) <- c("id","status_group")
+#write.csv(test_pred3, "svm_pred_R.csv")
+```
+
+This file was submitted to drivendata.org and the score was 0.6458.  
+
+![](SVM_0_64_polynomial.PNG)
+
+
+Next, another SVM classifier was created, this time using the linear kernel.
+
+```{r}
+#classifier = svm(formula = status_group ~ ., data = trainmodel1, type = 'C-classification', 
+               #  kernel = 'linear')
+
+#classifier
+#pred = predict(classifier, stacked[(nrow(training_labels)+1):nrow(stacked),])
+
+```
+
+**The resulting classifier looks like this:**
+
+**Parameters:**
+1. SVM-Type:  C-classification 
+2. SVM-Kernel:  linear 
+3.cost:  1 
+
+Number of Support Vectors:  33401
+
+```{r}
+
+
+#pred = predict(classifier, stacked[(nrow(training_labels)+1):nrow(stacked),])
+
+#test_pred4 <- cbind(test$id, as.data.frame(pred))
+#colnames(test_pred4) <- c("id","status_group")
+#write.csv(test_pred4, "svm_pred_R_linear.csv")
+```
+This file was also submitted to drivendata.org and the score was 0.7236. 
+
+![](SVM_0_72_linear.PNG)
+
+
+## Cross Validation 
+The Number of folds is equal to ten.
+
+```{r}
+## Cross Validation
+trainmodel1 <- cbind(postchi[1:nrow(training_labels),], status_group = training_labels$status_group)
+numFolds <- trainControl(method = "cv", number = 10)
+cpGrid <- expand.grid(.cp = seq(0.01, 0.5, 0.01))
+train(status_group ~ ., data=trainmodel1, method = "rpart", trControl = numFolds, tuneGrid = cpGrid)
+```
+
+The cp value of 0.04 below in the rpart method was set based on the result of the above train function call.
+```{r}
+testcv <- stacked[(nrow(training_labels)+1):nrow(stacked),]
+rfCV <- rpart(status_group ~ ., data=trainmodel1, method = "class", cp = 0.04)
+predictionCV <- predict(rfCV, newdata = testcv, type = "class")
+
+
+test_pred_cv <- cbind(test$id, as.data.frame(predictionCV))
+colnames(test_pred_cv) <- c("id","status_group")
+write.csv(test_pred_cv, "rf_pred_CV.csv")
+```
+
+# Conclusion and recommendations to the Tanzanian Water Ministry
+We developed our modelling Solutions using R, Python and Dataiku.
+Howver, in this submission we are only including the code for the Random Forest + ChiSquared Feature Selection Model.
+The SVM code is also included in this submission but because it takes roughly 20 mins to train each svm model, the code remains commented out.  But we have included the screen shots which show the score that was given on datadriven.org
+This can be seen in the section above called: SVM.
+
+We submitted several files to datadriven.org. 
+
+Here are the scores that we got for the different models that we trained:
+Random Forest + ChiSquared Feature Selection: 0.8105 
+SVM with C-classification and kernel = 'linear':  0.7236
+SVM with C-classification and kernel = 'polynomial':  0.6458
+Decision Tree:  0.7430
+
+We can conclude that Random Forest + ChiSquared Feature Selection is the most best model for predicting the functionality of the water pumps in the test data set. 
+
+
+Check Username:its206, score-0.8105
+
+
+Recommmendations for the Tanzanian Water Ministry:
+1.Distance from the capital: the farther the water pump from Dodoma, the more likely the pump is to be non functional. 
+2.Age: the older the water pump, the more likely it is to be non functional.  Therefore we reccommend that the Water Ministry carry out more frequent inspections of these water pumps, in order to identify non functioning pumps.
+3.Altitude: The higher the water pump's altitude is, the more likely it is to be functioning. Maybe a suggestion for future projects is to build pipelines that bring the water to the lower altitude areas, instead of always building water pumps in low altitude areas.
+According to the analysis,these regions have a high variable importance: Region 11, 16, 17.
+This means that the Ministry should carry out more frequent inspections of these water pumps.
+4. Column Payments are really important, because the payments that were not made are correlated with non functionality of the pumps.
+5.Population is one of the important features, as the population increases-pump is more likely to go out of order.
+6.The area dryer than usual areas in Tanzania will need repair more frequently.
+
